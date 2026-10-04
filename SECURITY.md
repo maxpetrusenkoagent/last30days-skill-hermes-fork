@@ -24,15 +24,21 @@ Mechanically, it:
 - runs a local Python engine (`skills/last30days/scripts/last30days.py`) and,
   for X search, a vendored Node client that is a search-only subset of the MIT
   `@steipete/bird` CLI (`scripts/lib/vendor/bird-search/`);
-- makes outbound HTTPS calls only to the platforms being researched and to
-  providers you configure (see "Network destinations");
+- makes outbound calls to the platforms being researched, providers you
+  configure, local browser-backed services you opt into, and watchlist webhooks
+  you configure (see "Network destinations");
 - runs local binaries when present: `yt-dlp` (YouTube transcripts), the `gh`
   CLI (GitHub search), `digg-pp-cli` (Digg), and optionally the `xurl` CLI
-  (official X API v2, OAuth2);
+  (official X API v2, OAuth2). YouTube retrieval can also be routed through a
+  configured `ssh` host, and the setup wizard may run `brew install yt-dlp` if
+  Homebrew is available and you choose auto-install;
 - reads optional credentials from environment variables, `.env` files, the
   macOS Keychain, or `pass` (see "Credentials");
-- writes briefings to `LAST30DAYS_MEMORY_DIR`, which defaults to `~/Documents/Last30Days/`, and, in watchlist mode only, keeps local state in
-  a SQLite database.
+- writes briefings when `--save-dir` is supplied or `LAST30DAYS_MEMORY_DIR` is
+  set. The slash-command wrapper supplies `--save-dir` from
+  `${LAST30DAYS_MEMORY_DIR:-$HOME/Documents/Last30Days}`; a direct
+  `last30days.py` invocation without either setting does not write a briefing
+  file. In watchlist mode only, it keeps local state in a SQLite database.
 
 The engine contains no telemetry, analytics, or phone-home code.
 
@@ -45,7 +51,9 @@ The engine contains no telemetry, analytics, or phone-home code.
   `api.openai.com`, the xAI key only to `api.x.ai`, and so on.
 - It never logs or writes API keys into report files, and debug output redacts
   request keys (including keys a provider echoes back in an error body).
-- It never sends data to endpoints other than the ones listed below.
+- It has no hidden telemetry endpoint. Outbound destinations are the hosts in
+  "Network destinations," configured provider base URLs, configured local
+  services, and configured watchlist delivery webhooks.
 
 ## Trust boundary
 
@@ -82,14 +90,18 @@ keys unlock the remaining sources and are resolved in this priority order:
 1. process environment variables;
 2. project-scoped `.claude/last30days.env`, then the global
    `~/.config/last30days/.env`;
-3. macOS Keychain items prefixed `last30days-` (`scripts/setup-keychain.sh`);
-4. a `pass`(1) store (`scripts/setup-pass.sh`) as the lowest-priority source,
-   decrypted transiently so secrets stay encrypted at rest.
+3. macOS Keychain items prefixed `last30days-`
+   (`skills/last30days/scripts/setup-keychain.sh`);
+4. a `pass`(1) store (`skills/last30days/scripts/setup-pass.sh`), read by
+   `lib/env.py::_load_pass` as the lowest-priority source and decrypted
+   transiently so secrets stay encrypted at rest. The source is additive: it is
+   skipped silently when `pass` is not installed.
 
-Rules the engine enforces:
+Secret handling checks:
 
-- secret files must be `0600` on POSIX hosts; the engine warns on every run if
-  they are not (`lib/env.py`, `_check_file_permissions`);
+- secret files should be `0600` on POSIX hosts. The engine emits a
+  non-blocking warning when group or other users can read a `.env` file, then
+  continues loading it (`lib/env.py`, `_check_file_permissions`);
 - keys stay with their provider and are never written into output files;
 - `--diagnose` reports which sources are *available*, not the keys themselves.
 
@@ -115,29 +127,45 @@ instead.
 
 ## Network destinations
 
-Outbound calls go to the platforms being researched and to providers you
-configure. Grouped by purpose:
+Outbound calls go to the platforms being researched, the providers and base
+URLs you configure, local browser-backed services you opt into, and watchlist
+delivery webhooks you configure. Grouped by purpose:
 
 | Purpose | Hosts |
 |---|---|
-| X / Twitter search | `x.com`, `twitter.com`, `upload.twitter.com` (cookie auth), `api.x.ai` (xAI), `xquik.com`, `api.scrapecreators.com` |
+| X / Twitter search | `api.x.com` (official API v2), `x.com`, `twitter.com`, `upload.twitter.com` (cookie auth), `api.x.ai` (xAI), `xquik.com`, `api.scrapecreators.com` |
 | Reddit | `reddit.com`, `www.reddit.com` (public data; ScrapeCreators only as a backup) |
-| YouTube / TikTok / Instagram / Threads / Pinterest | `www.youtube.com` (via local `yt-dlp`), `www.tiktok.com`, `www.instagram.com`, `www.threads.net`, `www.pinterest.com`, `api.scrapecreators.com` |
+| YouTube / TikTok / Instagram / Threads / Pinterest | `www.youtube.com` (via local `yt-dlp`; optionally over a configured `ssh` host), `www.tiktok.com`, `www.instagram.com`, `www.threads.net`, `www.pinterest.com`, `api.scrapecreators.com` |
 | Hacker News | `hn.algolia.com`, `news.ycombinator.com` |
 | Polymarket | `polymarket.com`, `gamma-api.polymarket.com` |
 | GitHub | `github.com`, `api.github.com` (via `gh`) |
-| Bluesky / TruthSocial / Digg | `bsky.app`, `truthsocial.com`, `di.gg` |
+| Bluesky | `bsky.social` for session creation/refresh, `api.bsky.app` for search by default, or a configured `BSKY_SEARCH_HOST` override |
+| TruthSocial / Digg | `truthsocial.com`, `di.gg` |
+| Xiaohongshu / RED | local HTTP service `http://localhost:18060`, Docker-host fallback `http://host.docker.internal:18060`, or the configured `XIAOHONGSHU_API_BASE`; result links point at `www.xiaohongshu.com` |
 | Web search & grounding | `api.openai.com`, `openrouter.ai`, `api.x.ai`, `generativelanguage.googleapis.com`, `r.jina.ai`, `html.duckduckgo.com`, plus Brave/Parallel/Exa/Serper APIs when configured |
 | Jobs / hiring signals | `boards.greenhouse.io`, `apply.workable.com`, `jobs.smartrecruiters.com` |
 | Reasoning provider | `api.openai.com`, `chatgpt.com/backend-api` (Codex login), `api.x.ai`, `openrouter.ai`, `generativelanguage.googleapis.com` |
+| Watchlist delivery | the configured Slack incoming webhook or generic HTTPS webhook URL (`skills/last30days/scripts/watchlist.py` rejects non-HTTPS delivery URLs) |
 
 ## Security posture
 
-Every commit and pull request runs through CI that includes: a secret scan, a
-Semgrep SAST scan, a dependency audit and dependency review, zizmor (GitHub
-Actions hardening), OpenSSF Scorecard tracking, and the full test suite —
-which contains security-boundary tests (e.g. credential-source precedence,
-secret-file permission warnings, and setup-store key masking).
+The repository separates blocking PR checks from scheduled/advisory posture
+checks:
+
+- blocking checks on pull requests and pushes to `main`: the full test suite,
+  the `uv audit --locked` dependency audit, the verified-secret scan
+  (TruffleHog, `--results=verified`), and zizmor for GitHub Actions hardening.
+  Dependency review additionally runs on pull requests only;
+- advisory: the Semgrep SAST scan runs on pull requests and pushes to `main`
+  with `continue-on-error`, so source-level findings are visible while the
+  baseline is cleaned up;
+- OpenSSF Scorecard runs on the default branch and on a weekly scheduled workflow;
+  it publishes SARIF/trend data and does not block pull-request merges;
+- OSV-Scanner runs on a weekly scheduled workflow to catch newly disclosed CVEs in
+  lockfiles between PRs; it is currently advisory (`fail-on-vuln: false`).
+
+The test suite contains security-boundary tests (e.g. credential-source
+precedence, secret-file permission warnings, and setup-store key masking).
 
 ## Reporting a vulnerability
 
