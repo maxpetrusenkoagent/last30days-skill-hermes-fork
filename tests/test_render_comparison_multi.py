@@ -101,6 +101,11 @@ class RenderComparisonMultiTests(unittest.TestCase):
         self.assertIn("## xAI", rendered)
         # Scaffold table header has a column per entity
         self.assertIn("| Dimension | OpenAI | Anthropic | xAI |", rendered)
+        # No verdict row: the pitch-vs-pulse signal ships as synthesis prose,
+        # not a table axis (early drafts emitted a "Setting the narrative?" row)
+        self.assertNotIn("Setting the narrative?", rendered)
+        # "What it is" grounds in positioning fetched this run, never memory
+        self.assertIn("never from memory", rendered)
         # Envelope scaffolding present
         self.assertIn("EVIDENCE FOR SYNTHESIS", rendered)
         self.assertIn("END OF last30days CANONICAL OUTPUT", rendered)
@@ -140,6 +145,31 @@ class RenderComparisonMultiTests(unittest.TestCase):
     def test_raises_on_empty_input(self):
         with self.assertRaises(ValueError):
             render.render_comparison_multi([])
+
+    def test_context_emit_carries_warnings(self):
+        # render_context shows warnings for a single entity; comparison
+        # context mode dropped them, so --emit=context was the one supported
+        # output where a dropped entity or failed source was invisible.
+        report_a = _build_report("OpenAI", ["GPT-5 drop"])
+        report_b = _build_report("Anthropic", ["Claude 4.7"])
+        report_a.warnings.append(
+            "Comparison is incomplete: 1 of 3 entities failed and were dropped (xAI)."
+        )
+        report_b.warnings.append("Exa returned 0 results")
+        out = render.render_comparison_multi_context(
+            [("OpenAI", report_a), ("Anthropic", report_b)]
+        )
+        self.assertIn("Warnings:", out)
+        self.assertIn("[OpenAI] Comparison is incomplete", out)
+        self.assertIn("[Anthropic] Exa returned 0 results", out)
+        # Above the per-entity sections so it survives tail truncation.
+        self.assertLess(out.index("Warnings:"), out.index("## OpenAI"))
+
+    def test_context_emit_omits_empty_warnings_block(self):
+        out = render.render_comparison_multi_context(
+            [("OpenAI", _build_report("OpenAI", ["GPT-5 drop"]))]
+        )
+        self.assertNotIn("Warnings:", out)
 
     def test_context_emit(self):
         reports = [
@@ -269,7 +299,8 @@ class EmitComparisonOutputTests(unittest.TestCase):
         self.assertEqual(payload["entities"], ["OpenAI", "Anthropic"])
         self.assertEqual(len(payload["reports"]), 2)
         self.assertEqual(payload["reports"][0]["entity"], "OpenAI")
-        self.assertIn("topic", payload["reports"][0]["report"])
+        self.assertEqual(payload["schema_version"], "1.4")
+        self.assertIn("query", payload["reports"][0]["report"])
 
     def test_compact_and_md_both_route_to_multi(self):
         reports = [

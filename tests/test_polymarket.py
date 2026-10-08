@@ -146,8 +146,13 @@ def test_passes_topic_filter_partial_match():
     """Test that at least one informative word must match."""
     # "AI" appears in both topic and title
     assert polymarket._passes_topic_filter("AI safety", "New AI Safety Conference") is True
-    # "models" doesn't appear, should fail
-    assert polymarket._passes_topic_filter("AI models", "New AI prediction") is False
+    # LOCAL DIVERGENCE from upstream: this asserted False, on the rule that a
+    # domain word ("ai") is too broad to be the sole match signal. That rule
+    # made domain sweeps impossible — an AI-news topic matched zero AI markets
+    # ever, because real titles say "AI" and never "artificial intelligence".
+    # _passes_topic_filter now falls back to _DOMAIN_WORDS when the informative
+    # words miss, so "AI models" does match an AI market.
+    assert polymarket._passes_topic_filter("AI models", "New AI prediction") is True
 
 
 def test_passes_topic_filter_all_noise_words():
@@ -182,6 +187,36 @@ def test_passes_topic_filter_two_word_still_needs_one():
     assert polymarket._passes_topic_filter(
         "Kanye West", "Kanye divorce settlement"
     ) is True
+
+
+
+def test_domain_fallback_keeps_soft_sweep_ai_markets():
+    """Soft sweep residue may match via domain words (the #859 fix)."""
+    assert polymarket._passes_topic_filter(
+        "AI frontier developments", "Will AI models beat humans at coding?"
+    ) is True
+
+
+
+def test_domain_fallback_treats_plural_domain_terms_as_domain():
+    """Plural domain tokens (models) must not block soft AI sweeps."""
+    assert polymarket._passes_topic_filter(
+        "AI models frontier developments",
+        "Will AI beat humans at coding by 2027?",
+    ) is True
+    assert polymarket._passes_topic_filter(
+        "AI models", "New AI prediction"
+    ) is True
+
+
+def test_domain_fallback_blocked_when_hard_informative_misses():
+    """Mixed topics must not accept unrelated markets via a shared domain token."""
+    assert polymarket._passes_topic_filter(
+        "MCP protocol benchmark", "Will the Kyoto Protocol survive?"
+    ) is False
+    assert polymarket._passes_any_informative_word(
+        "MCP protocol benchmark", "Will the Kyoto Protocol survive?"
+    ) is False
 
 
 def test_passes_topic_filter_multi_word_edge_exactly_three():
@@ -347,8 +382,31 @@ def test_shorten_question_long():
     """Test truncation of very long questions."""
     long_q = "A" * 100
     result = polymarket._shorten_question(long_q)
-    
+
     assert len(result) <= 40
+
+
+def test_shorten_question_fallback_strips_leading_article():
+    """The truncation fallback must not keep a leading article like 'an' or 'the'.
+
+    Without stripping, a question like 'an Anthropic Claude model scores...' yields
+    a lead name of just 'an', which renders as the mangled 'an 19%' footer fragment.
+    """
+    result = polymarket._shorten_question(
+        "an Anthropic Claude model scores at the top of the leaderboard this month"
+    )
+    lower = result.lower()
+    assert not lower.startswith("a ")
+    assert not lower.startswith("an ")
+    assert not lower.startswith("the ")
+
+
+def test_shorten_question_fallback_keeps_non_article_lead():
+    """Stripping only removes a leading article, not the first informative word."""
+    result = polymarket._shorten_question(
+        "Anthropic ships a major Claude model update before the end of this month"
+    )
+    assert result.lower().startswith("anthropic")
 
 # === Tests for search_polymarket() ===
 
@@ -381,18 +439,18 @@ def test_search_polymarket_query_expansion():
     # Should expand to multiple queries
     assert len(queries) >= 2
 
-@patch('lib.polymarket.http.post')
-
-
-def test_search_polymarket_http_error_handling(mock_post):
+@patch('lib.polymarket.http.request')
+def test_search_polymarket_http_error_handling(mock_request):
     """Test graceful handling of HTTP errors."""
     from lib.http import HTTPError
-    mock_post.side_effect = HTTPError("HTTP 429: Rate limit")
+    mock_request.side_effect = HTTPError("HTTP 429: Rate limit", status_code=429)
     
     result = polymarket.search_polymarket("test", "2026-01-01", "2026-01-31")
     
-    # Should return structure with error
-    assert "events" in result or "error" in result
+    assert mock_request.call_count > 0
+    assert all(call.args[0] == "GET" for call in mock_request.call_args_list)
+    assert result["events"] == []
+    assert "HTTP 429: Rate limit" in result["error"]
 
 # === Tests for parse_polymarket_response() ===
 
@@ -408,24 +466,28 @@ def test_parse_polymarket_response_basic():
     
     items = polymarket.parse_polymarket_response(response, topic="AI")
     
-    assert len(items) >= 0
-    # Items may be filtered by topic filter
+    assert len(items) == 1
+    assert items[0]["event_id"] == "evt-123"
+    assert items[0]["title"] == "Will AI surpass humans?"
+    assert items[0]["outcome_prices"] == [("Yes", 0.6), ("No", 0.4)]
 
 
 def test_parse_polymarket_response_filters_closed():
     """Test that closed events are filtered."""
     response = {
         "events": [
-            create_mock_event(closed=False),
-            create_mock_event(closed=True),
+            create_mock_event(event_id="open", slug="open-event", closed=False,
+                              markets=[create_mock_market(market_id="open-market")]),
+            create_mock_event(event_id="closed", slug="closed-event", closed=True,
+                              markets=[create_mock_market(market_id="still-open-market")]),
         ]
     }
     
     items = polymarket.parse_polymarket_response(response)
     
-    # Closed events should be filtered
-    # (exact count depends on market filtering)
-    assert isinstance(items, list)
+    assert [item["event_id"] for item in items] == ["open"]
+    historical = polymarket.parse_polymarket_response(response, include_closed=True)
+    assert [item["event_id"] for item in historical] == ["open", "closed"]
 
 
 def test_parse_polymarket_response_empty():
@@ -448,9 +510,8 @@ def test_parse_polymarket_response_market_url():
     
     items = polymarket.parse_polymarket_response(response, topic="test")
     
-    if items:  # If not filtered
-        assert "url" in items[0]
-        assert "polymarket.com" in items[0]["url"]
+    assert len(items) == 1
+    assert items[0]["url"] == "https://polymarket.com/event/test-event-slug"
 
 
 def test_parse_polymarket_response_engagement():
@@ -460,33 +521,75 @@ def test_parse_polymarket_response_engagement():
             title="AI Event",
             volume24hr=250000,
             liquidity=100000,
+            markets=[{**create_mock_market(liquidity="1234"), "volume24hr": 5678}],
         )]
     }
     
     items = polymarket.parse_polymarket_response(response, topic="AI")
-    
-    if items:  # If not filtered
-        # Check for volume or liquidity fields
-        assert "volume24hr" in items[0] or "liquidity" in items[0] or isinstance(items[0], dict)
+
+    assert len(items) == 1
+    assert items[0]["volume24hr"] == 250000.0
+    assert items[0]["liquidity"] == 100000.0
+
+
+def _claude_downtime_response():
+    """An off-topic Polymarket event that mentions only the generic word 'Claude'."""
+    return {
+        "events": [
+            create_mock_event(
+                event_id="evt-noise",
+                title="Will Claude go down 3-5 times in June?",
+                slug="claude-downtime",
+            ),
+        ]
+    }
+
+
+def test_parse_polymarket_response_filters_noise_on_full_subquery():
+    """A multi-word subquery filters off-topic 'Claude downtime' noise.
+
+    'Claude Code subagents workflow' carries 3 informative words; the downtime
+    title matches only one ('claude'), so the min-2 rule drops it.
+    """
+    items = polymarket.parse_polymarket_response(
+        _claude_downtime_response(), topic="Claude Code subagents workflow"
+    )
+    assert items == []
+
+
+def test_parse_polymarket_response_narrow_subquery_leaks_noise():
+    """The SAME off-topic market leaks through a single-word subquery.
+
+    'claude' has one informative word, so the min-match threshold drops to 1 and
+    the downtime market passes. Because the pipeline previously fed the per-subquery
+    search_query, filtering swung between these two outcomes across the fanout;
+    keying off the stable original topic makes it consistent. This pair pins that
+    threshold-by-word-count behavior the wiring fix depends on.
+    """
+    items = polymarket.parse_polymarket_response(
+        _claude_downtime_response(), topic="claude"
+    )
+    assert len(items) == 1
 
 # === Tests for engagement scoring ===
 
 
 def test_engagement_with_volume():
-    """Test engagement calculation with volume."""
+    """Missing event metrics fall back to the selected market's values."""
     response = {
         "events": [create_mock_event(
             title="Test",
-            volume24hr=500000,
+            volume24hr=0,
+            liquidity=0,
+            markets=[{**create_mock_market(liquidity="6789"), "volume24hr": "1234"}],
         )]
     }
     
     items = polymarket.parse_polymarket_response(response, topic="test")
     
-    if items:
-        engagement = items[0].get("engagement", {})
-        # volume24hr should be captured
-        assert "volume24hr" in engagement or isinstance(engagement, dict)
+    assert len(items) == 1
+    assert items[0]["volume24hr"] == 1234.0
+    assert items[0]["liquidity"] == 6789.0
 
 # === Tests for noise-word query skipping ===
 
@@ -522,39 +625,45 @@ def test_expand_queries_all_noise_words_keeps_phrase():
 
 def test_per_item_relevance_floor_drops_zero_items():
     """Items with relevance 0.0 should be dropped even if best item is high."""
-    # Simulate the filtering logic directly
-    items = [
-        {"relevance": 0.85, "title": "Kanye market"},
-        {"relevance": 0.45, "title": "Related market"},
-        {"relevance": 0.0, "title": "Golf noise"},
-        {"relevance": 0.0, "title": "Cycling noise"},
+    events = [
+        create_mock_event(event_id="golf", title="Golf championship"),
+        create_mock_event(event_id="relevant", title="Prediction market"),
+        create_mock_event(event_id="cycling", title="Cycling championship"),
     ]
-    filtered = [i for i in items if i["relevance"] >= 0.10]
-    assert len(filtered) == 2
-    assert all(i["title"] != "Golf noise" for i in filtered)
+    # A generic topic passes the earlier title gate, leaving the score floor
+    # responsible for removing these otherwise valid events.
+    assert all(polymarket._passes_topic_filter("market", event["title"]) for event in events)
+    items = polymarket.parse_polymarket_response({"events": events}, topic="market")
+    assert [item["event_id"] for item in items] == ["relevant"]
 
 
-def test_per_item_relevance_floor_keeps_borderline():
+def test_per_item_relevance_floor_keeps_borderline(monkeypatch):
     """Items at exactly 0.10 should be kept."""
-    items = [
-        {"relevance": 0.85, "title": "Main market"},
-        {"relevance": 0.10, "title": "Borderline market"},
-        {"relevance": 0.09, "title": "Below floor"},
+    scores = {"Main market": 1.0, "Borderline market": 0.13, "Below floor": 0.12}
+    monkeypatch.setattr(polymarket, "_compute_text_similarity", lambda _topic, title, _outcomes: scores[title])
+    events = [
+        create_mock_event(
+            event_id=event_id, title=title, volume24hr=0, liquidity=1,
+            markets=[create_mock_market(volume="0", liquidity="1")],
+        )
+        for event_id, title in [("below", "Below floor"), ("main", "Main market"),
+                                ("boundary", "Borderline market")]
     ]
-    filtered = [i for i in items if i["relevance"] >= 0.10]
-    assert len(filtered) == 2
-    assert filtered[1]["title"] == "Borderline market"
+    items = polymarket.parse_polymarket_response({"events": events}, topic="market")
+    assert [(item["event_id"], item["relevance"]) for item in items] == [
+        ("main", 0.75), ("boundary", 0.10),
+    ]
 
 
 def test_per_item_relevance_floor_no_drops_when_all_high():
     """Nothing dropped when all items are above the floor."""
-    items = [
-        {"relevance": 0.85, "title": "A"},
-        {"relevance": 0.50, "title": "B"},
-        {"relevance": 0.30, "title": "C"},
-    ]
-    filtered = [i for i in items if i["relevance"] >= 0.10]
-    assert len(filtered) == 3
+    response = {"events": [
+        create_mock_event(event_id=event_id, title=f"Prediction market {event_id}")
+        for event_id in ["a", "b", "c"]
+    ]}
+    items = polymarket.parse_polymarket_response(response, topic="market")
+    assert [item["event_id"] for item in items] == ["a", "b", "c"]
+    assert all(item["relevance"] >= 0.30 for item in items)
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

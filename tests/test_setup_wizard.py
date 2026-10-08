@@ -1,5 +1,9 @@
 """Tests for the first-run setup wizard module."""
 
+import json
+import os
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from unittest.mock import patch, MagicMock
@@ -7,6 +11,28 @@ from unittest.mock import patch, MagicMock
 import pytest
 
 from lib import setup_wizard
+import last30days as cli
+
+
+class _NtOs:
+    """Delegates to the real os module but reports name == 'nt'.
+
+    Patched only in setup_wizard's own namespace (mirrors
+    tests/test_health_probe_taxonomy.py's ``_NtOs``) so pathlib and the rest
+    of the test process are unaffected.
+    """
+    name = "nt"
+
+    def __getattr__(self, attr):
+        return getattr(os, attr)
+
+
+class _PosixOs:
+    """Delegates to the real os module but reports name == 'posix'."""
+    name = "posix"
+
+    def __getattr__(self, attr):
+        return getattr(os, attr)
 
 
 class TestIsFirstRun:
@@ -49,18 +75,20 @@ class TestRunAutoSetup:
         mock_which.return_value = "/usr/local/bin/yt-dlp"
 
         config = {}
-        results = setup_wizard.run_auto_setup(config)
+        results = setup_wizard.run_auto_setup(config, allow_browser_cookies=True)
 
         assert "x" in results["cookies_found"]
         assert results["cookies_found"]["x"] == "chrome"
         assert results["ytdlp_installed"] is True
         assert results["ytdlp_action"] == "already_installed"
         assert results["env_written"] is False
+        assert results["browser_cookie_scan_attempted"] is True
 
     @patch("lib.cookie_extract.extract_cookies_with_source")
     @patch("shutil.which")
-    def test_no_cookies_found(self, mock_which, mock_extract):
+    def test_no_cookies_found(self, mock_which, mock_extract, monkeypatch):
         """When no cookies found, results dict has empty cookies_found."""
+        monkeypatch.setattr(setup_wizard, "os", _PosixOs())
         mock_extract.return_value = None
         mock_which.return_value = None
 
@@ -68,6 +96,8 @@ class TestRunAutoSetup:
         results = setup_wizard.run_auto_setup(config)
 
         assert results["cookies_found"] == {}
+        mock_extract.assert_not_called()
+        assert results["browser_cookie_scan_attempted"] is False
         assert results["ytdlp_installed"] is False
         assert results["ytdlp_action"] == "no_homebrew"
 
@@ -79,9 +109,10 @@ class TestRunAutoSetup:
         mock_which.return_value = None
 
         config = {}
-        results = setup_wizard.run_auto_setup(config)
+        results = setup_wizard.run_auto_setup(config, allow_browser_cookies=True)
 
         assert results["cookies_found"] == {}
+        assert results["browser_cookie_scan_attempted"] is True
 
     @patch("lib.cookie_extract.extract_cookies_with_source")
     @patch("shutil.which")
@@ -98,10 +129,125 @@ class TestRunAutoSetup:
         mock_which.return_value = None
 
         config = {}
-        results = setup_wizard.run_auto_setup(config)
+        results = setup_wizard.run_auto_setup(config, allow_browser_cookies=True)
 
         assert results["cookies_found"]["x"] == "firefox"
         assert results["cookies_found"]["truthsocial"] == "firefox"
+
+    @patch("lib.cookie_extract.extract_cookies_with_source")
+    @patch("shutil.which")
+    def test_default_scan_order_is_chromium_first(self, mock_which, mock_extract):
+        """U1: with FROM_BROWSER unset, the scan tries Chrome before Safari.
+
+        Safari is the only X-cookie source needing Full Disk Access; Chrome
+        reads via the Keychain with no FDA. The wizard must try the Chromium
+        family first so the common macOS user does not hit the FDA dead-end.
+        """
+        tried = []
+
+        def side_effect(browser, domain, cookie_names):
+            tried.append(browser)
+            return None  # never find cookies, so every browser is attempted
+
+        mock_extract.side_effect = side_effect
+        mock_which.return_value = None
+
+        setup_wizard.run_auto_setup({}, allow_browser_cookies=True)
+
+        # Order within the first domain's attempts must be chromium-first.
+        assert "chrome" in tried and "safari" in tried
+        assert tried.index("chrome") < tried.index("safari")
+        assert tried.index("chrome") < tried.index("firefox")
+        # And it must not route through the silent-first "auto" order.
+        assert tried[0] == "chrome"
+
+
+    @patch("lib.cookie_extract.extract_cookies_with_source")
+    @patch("shutil.which")
+    def test_official_only_host_skips_cookie_loop_for_every_domain(self, mock_which, mock_extract):
+        """U6/R5: on an official-only host (LAST30DAYS_HOST=grok-bot) the
+        consented cookie scan is skipped for X AND Truth Social, the result
+        records a neutral note, and the CLI installs (yt-dlp) still run."""
+        mock_extract.return_value = ({"auth_token": "abc", "ct0": "xyz"}, "chrome")
+        mock_which.return_value = "/usr/local/bin/yt-dlp"
+
+        config = {"LAST30DAYS_HOST": "grok-bot"}
+        results = setup_wizard.run_auto_setup(config, allow_browser_cookies=True)
+
+        mock_extract.assert_not_called()
+        assert results["cookies_found"] == {}
+        assert results["browser_cookie_scan_attempted"] is False
+        assert results["cookie_note"] == "browser sessions are not read on this host"
+        # The free CLI installs still run: the yt-dlp probe happened.
+        assert any(call.args[:1] == ("yt-dlp",) for call in mock_which.call_args_list)
+        assert results["ytdlp_installed"] is True
+        assert results["ytdlp_action"] == "already_installed"
+
+    @patch("lib.cookie_extract.extract_cookies_with_source")
+    @patch("shutil.which")
+    def test_official_only_host_status_text_names_no_cookies(self, mock_which, mock_extract):
+        """R4: the setup summary on an official-only host never names cookies."""
+        mock_which.return_value = None
+        results = setup_wizard.run_auto_setup(
+            {"LAST30DAYS_HOST": "grok-bot"}, allow_browser_cookies=True
+        )
+        results["env_written"] = True  # what the CLI sets before rendering
+        text = setup_wizard.get_setup_status_text(results)
+        assert setup_wizard.OFFICIAL_HOST_COOKIE_NOTE in text
+        assert "Configuration saved." in text
+        lowered = text.lower()
+        for banned in ("cookies", "cdp", "box-chrome", "bird", "auth_token", "ct0", "xquik", "browsers"):
+            assert banned not in lowered, f"{banned!r} leaked into setup status text: {text!r}"
+
+    def test_status_text_without_note_keeps_browser_tail(self):
+        """R14: non-Grok hosts keep today's status tail byte for byte."""
+        text = setup_wizard.get_setup_status_text({"env_written": True, "ytdlp_action": "already_installed"})
+        assert "Configuration saved. Future runs will auto-detect your browsers." in text
+
+    @patch("lib.cookie_extract.extract_cookies_with_source")
+    @patch("shutil.which")
+    def test_bird_pin_on_official_only_host_re_enables_cookie_scan(self, mock_which, mock_extract):
+        """KTD7: the exclusive LAST30DAYS_X_BACKEND=bird pin is the one path
+        that re-enables discovery on an official-only host."""
+        mock_extract.return_value = None
+        mock_which.return_value = None
+        config = {"LAST30DAYS_HOST": "grok-bot", "LAST30DAYS_X_BACKEND": "bird"}
+        results = setup_wizard.run_auto_setup(config, allow_browser_cookies=True)
+        assert mock_extract.called
+        assert results["browser_cookie_scan_attempted"] is True
+        assert "cookie_note" not in results
+
+    @patch("lib.cookie_extract.extract_cookies_with_source")
+    @patch("shutil.which")
+    def test_partial_pair_not_recorded_as_found(self, mock_which, mock_extract):
+        """A partial X pair (lone ct0) is not a found source."""
+        mock_extract.return_value = ({"ct0": "lone_ct0"}, "chrome")
+        mock_which.return_value = None
+
+        results = setup_wizard.run_auto_setup({}, allow_browser_cookies=True)
+
+        assert results["cookies_found"] == {}
+        assert results["browser_cookie_scan_attempted"] is True
+
+    @patch("lib.cookie_extract.extract_cookies_with_source")
+    @patch("shutil.which")
+    def test_partial_then_complete_records_complete_source(self, mock_which, mock_extract):
+        """The scan keeps looking past a partial pair and records the
+        browser that yielded the complete one."""
+        def side_effect(browser, domain, cookie_names):
+            if domain == ".x.com":
+                if browser == "chrome":
+                    return ({"ct0": "lone_ct0"}, "chrome")
+                if browser == "firefox":
+                    return ({"auth_token": "abc", "ct0": "xyz"}, "firefox")
+            return None
+        mock_extract.side_effect = side_effect
+        mock_which.return_value = None
+
+        config = {"FROM_BROWSER": "chrome,firefox"}
+        results = setup_wizard.run_auto_setup(config, allow_browser_cookies=True)
+
+        assert results["cookies_found"]["x"] == "firefox"
 
 
 class TestYtdlpAutoInstall:
@@ -110,8 +256,9 @@ class TestYtdlpAutoInstall:
     @patch("lib.cookie_extract.extract_cookies_with_source", return_value=None)
     @patch("subprocess.run")
     @patch("shutil.which")
-    def test_ytdlp_missing_brew_available_installs(self, mock_which, mock_subproc, mock_extract):
-        """yt-dlp missing + brew available -> installs via brew."""
+    def test_ytdlp_missing_brew_available_installs(self, mock_which, mock_subproc, mock_extract, monkeypatch):
+        """yt-dlp missing + brew available (non-Windows) -> installs via brew."""
+        monkeypatch.setattr(setup_wizard, "os", _PosixOs())
         def which_side_effect(cmd):
             if cmd == "yt-dlp":
                 return None
@@ -132,14 +279,35 @@ class TestYtdlpAutoInstall:
 
     @patch("lib.cookie_extract.extract_cookies_with_source", return_value=None)
     @patch("shutil.which")
-    def test_ytdlp_missing_brew_missing(self, mock_which, mock_extract):
-        """yt-dlp missing + brew missing -> no_homebrew."""
+    def test_ytdlp_missing_brew_missing(self, mock_which, mock_extract, monkeypatch):
+        """yt-dlp missing + brew missing (non-Windows) -> no_homebrew."""
+        monkeypatch.setattr(setup_wizard, "os", _PosixOs())
         mock_which.return_value = None
 
         results = setup_wizard.run_auto_setup({})
 
         assert results["ytdlp_installed"] is False
         assert results["ytdlp_action"] == "no_homebrew"
+
+    @patch("lib.cookie_extract.extract_cookies_with_source", return_value=None)
+    @patch("shutil.which")
+    def test_ytdlp_missing_on_windows(self, mock_which, mock_extract, monkeypatch):
+        """Regression for #904: yt-dlp missing on Windows -> pip guidance, no
+        Homebrew attempt (Windows has no Homebrew and pip is the working path)."""
+        monkeypatch.setattr(setup_wizard, "os", _NtOs())
+        mock_which.return_value = None
+
+        with patch("subprocess.run") as mock_subproc:
+            results = setup_wizard.run_auto_setup({})
+            mock_subproc.assert_not_called()
+
+        assert results["ytdlp_installed"] is False
+        assert results["ytdlp_action"] == "no_pip_windows"
+
+        text = setup_wizard.get_setup_status_text(results)
+        assert "pip install yt-dlp" in text
+        assert "Homebrew" not in text
+        assert "Scripts" in text
 
     @patch("lib.cookie_extract.extract_cookies_with_source", return_value=None)
     @patch("shutil.which")
@@ -155,8 +323,9 @@ class TestYtdlpAutoInstall:
     @patch("lib.cookie_extract.extract_cookies_with_source", return_value=None)
     @patch("subprocess.run")
     @patch("shutil.which")
-    def test_brew_install_fails(self, mock_which, mock_subproc, mock_extract):
-        """brew install yt-dlp fails -> install_failed with stderr."""
+    def test_brew_install_fails(self, mock_which, mock_subproc, mock_extract, monkeypatch):
+        """brew install yt-dlp fails (non-Windows) -> install_failed with stderr."""
+        monkeypatch.setattr(setup_wizard, "os", _PosixOs())
         def which_side_effect(cmd):
             if cmd == "yt-dlp":
                 return None
@@ -173,11 +342,209 @@ class TestYtdlpAutoInstall:
         assert "something broke" in results["ytdlp_stderr"]
 
 
+class TestDiggAutoInstall:
+    """Tests for digg-pp-cli auto-install via npx in run_auto_setup()."""
+
+    @patch("lib.cookie_extract.extract_cookies_with_source", return_value=None)
+    @patch("shutil.which")
+    def test_digg_already_installed(self, mock_which, mock_extract):
+        """digg-pp-cli already on PATH -> already_installed, no subprocess."""
+        # yt-dlp missing + brew missing keeps the yt-dlp path subprocess-free;
+        # digg-pp-cli present short-circuits before any npx call.
+        def which_side_effect(cmd):
+            return "/Users/me/go/bin/digg-pp-cli" if cmd == "digg-pp-cli" else None
+        mock_which.side_effect = which_side_effect
+
+        with patch("subprocess.run") as mock_subproc:
+            results = setup_wizard.run_auto_setup({})
+            mock_subproc.assert_not_called()
+
+        assert results["digg_installed"] is True
+        assert results["digg_action"] == "already_installed"
+
+    # Redirect HOME/GOPATH so real ~/.local/bin or ~/go/bin digg-pp-cli on the
+    # dev box does not make the binary look present during absence tests.
+    # USERPROFILE too: Path.home() reads it on Windows, and the two must agree.
+    @staticmethod
+    def _empty_home(tmp_path, monkeypatch):
+        monkeypatch.delenv("GOPATH", raising=False)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+
+    @patch("lib.cookie_extract.extract_cookies_with_source", return_value=None)
+    @patch("shutil.which")
+    def test_digg_no_npx(self, mock_which, mock_extract, tmp_path, monkeypatch):
+        """digg-pp-cli missing + npx missing -> no_npx, no subprocess."""
+        self._empty_home(tmp_path, monkeypatch)
+        mock_which.return_value = None
+
+        with patch("subprocess.run") as mock_subproc:
+            results = setup_wizard.run_auto_setup({})
+            mock_subproc.assert_not_called()
+
+        assert results["digg_installed"] is False
+        assert results["digg_action"] == "no_npx"
+
+    @patch("lib.cookie_extract.extract_cookies_with_source", return_value=None)
+    @patch("subprocess.run")
+    @patch("shutil.which")
+    def test_digg_install_succeeds(self, mock_which, mock_subproc, mock_extract, tmp_path, monkeypatch):
+        """npx present + install succeeds + binary verifiable -> installed."""
+        self._empty_home(tmp_path, monkeypatch)
+        # First which("digg-pp-cli") (pre-install) -> None, npx -> present,
+        # then post-install which("digg-pp-cli") -> resolves.
+        calls = {"digg": 0}
+
+        def which_side_effect(cmd):
+            if cmd == "digg-pp-cli":
+                calls["digg"] += 1
+                return None if calls["digg"] == 1 else "/Users/me/go/bin/digg-pp-cli"
+            if cmd == "npx":
+                return "/opt/homebrew/bin/npx"
+            return None
+        mock_which.side_effect = which_side_effect
+        mock_subproc.return_value = MagicMock(returncode=0, stderr="")
+
+        results = setup_wizard.run_auto_setup({})
+
+        # The wizard now also best-effort-installs the additional default-on
+        # Printing Press sources (arxiv/techmeme/trustpilot), so digg is one of
+        # several install calls rather than the only one. Argv[0] must be the
+        # *resolved* npx path (mirroring shutil.which's return value), not the
+        # bare "npx" string -- passing the bare name breaks Windows, where
+        # shutil.which resolves PATHEXT (npx.CMD) but subprocess.run does not.
+        mock_subproc.assert_any_call(
+            ["/opt/homebrew/bin/npx", "-y", setup_wizard.PRINTING_PRESS_NPM, "install", "digg", "--cli-only"],
+            capture_output=True, text=True, timeout=setup_wizard.DIGG_INSTALL_TIMEOUT,
+        )
+        assert results["digg_installed"] is True
+        assert results["digg_action"] == "installed"
+
+    @patch("lib.cookie_extract.extract_cookies_with_source", return_value=None)
+    @patch("subprocess.run")
+    @patch("shutil.which")
+    def test_digg_install_uses_resolved_windows_npx_path(
+        self, mock_which, mock_subproc, mock_extract, tmp_path, monkeypatch
+    ):
+        """Regression for #904: a Windows-style resolved npx path (PATHEXT
+        resolution, e.g. npx.CMD) must be passed to subprocess.run verbatim --
+        not the bare string "npx", which fails with WinError 2 on Windows
+        because CreateProcess does not do PATHEXT resolution the way
+        shutil.which does."""
+        self._empty_home(tmp_path, monkeypatch)
+        calls = {"digg": 0}
+        windows_npx = r"C:\Program Files\nodejs\npx.CMD"
+
+        def which_side_effect(cmd):
+            if cmd == "digg-pp-cli":
+                calls["digg"] += 1
+                return None if calls["digg"] == 1 else r"C:\Users\me\.local\bin\digg-pp-cli"
+            if cmd == "npx":
+                return windows_npx
+            return None
+        mock_which.side_effect = which_side_effect
+        mock_subproc.return_value = MagicMock(returncode=0, stderr="")
+
+        results = setup_wizard.run_auto_setup({})
+
+        mock_subproc.assert_any_call(
+            [windows_npx, "-y", setup_wizard.PRINTING_PRESS_NPM, "install", "digg", "--cli-only"],
+            capture_output=True, text=True, timeout=setup_wizard.DIGG_INSTALL_TIMEOUT,
+        )
+        assert results["digg_installed"] is True
+        assert results["digg_action"] == "installed"
+
+    @patch("lib.cookie_extract.extract_cookies_with_source", return_value=None)
+    @patch("subprocess.run")
+    @patch("shutil.which")
+    def test_digg_install_fails_nonzero(self, mock_which, mock_subproc, mock_extract, tmp_path, monkeypatch):
+        """npx install returns non-zero -> install_failed with stderr."""
+        self._empty_home(tmp_path, monkeypatch)
+        def which_side_effect(cmd):
+            return "/opt/homebrew/bin/npx" if cmd == "npx" else None
+        mock_which.side_effect = which_side_effect
+        mock_subproc.return_value = MagicMock(returncode=1, stderr="npm ERR! boom")
+
+        results = setup_wizard.run_auto_setup({})
+
+        assert results["digg_installed"] is False
+        assert results["digg_action"] == "install_failed"
+        assert "boom" in results["digg_stderr"]
+
+    @patch("lib.cookie_extract.extract_cookies_with_source", return_value=None)
+    @patch("shutil.which")
+    def test_digg_prior_install_off_path(self, mock_which, mock_extract, tmp_path, monkeypatch):
+        """pp-digg CLI at ~/.local/bin but not on PATH -> installed_off_path, no npx."""
+        self._empty_home(tmp_path, monkeypatch)
+        local_bin = tmp_path / ".local" / "bin"
+        local_bin.mkdir(parents=True)
+        binary = local_bin / "digg-pp-cli"
+        binary.write_text("#!/bin/sh\n")
+        binary.chmod(0o755)
+        mock_which.return_value = None
+
+        with patch("subprocess.run") as mock_subproc:
+            results = setup_wizard.run_auto_setup({})
+            mock_subproc.assert_not_called()
+
+        assert results["digg_installed"] is False
+        assert results["digg_action"] == "installed_off_path"
+        assert results["digg_path"] == str(binary)
+
+    @patch("lib.cookie_extract.extract_cookies_with_source", return_value=None)
+    @patch("subprocess.run")
+    @patch("shutil.which")
+    def test_digg_install_zero_but_not_on_path(self, mock_which, mock_subproc, mock_extract, tmp_path, monkeypatch):
+        """rc=0, binary at $HOME/.local/bin but not on PATH -> installed_off_path."""
+        self._empty_home(tmp_path, monkeypatch)
+        def which_side_effect(cmd):
+            return "/opt/homebrew/bin/npx" if cmd == "npx" else None
+        mock_which.side_effect = which_side_effect
+
+        local_bin = tmp_path / ".local" / "bin"
+
+        def fake_install(*args, **kwargs):
+            local_bin.mkdir(parents=True, exist_ok=True)
+            binary = local_bin / "digg-pp-cli"
+            binary.write_text("#!/bin/sh\n")
+            binary.chmod(0o755)
+            return MagicMock(returncode=0, stderr="")
+        mock_subproc.side_effect = fake_install
+
+        results = setup_wizard.run_auto_setup({})
+
+        assert results["digg_installed"] is False
+        assert results["digg_action"] == "installed_off_path"
+        assert results["digg_path"] == str(local_bin / "digg-pp-cli")
+
+    @patch("lib.cookie_extract.extract_cookies_with_source", return_value=None)
+    @patch("subprocess.run")
+    @patch("shutil.which")
+    def test_digg_install_timeout_does_not_raise(self, mock_which, mock_subproc, mock_extract, tmp_path, monkeypatch):
+        """subprocess raising (e.g. timeout) -> install_failed, no exception escapes."""
+        self._empty_home(tmp_path, monkeypatch)
+        def which_side_effect(cmd):
+            return "/opt/homebrew/bin/npx" if cmd == "npx" else None
+        mock_which.side_effect = which_side_effect
+        mock_subproc.side_effect = subprocess.TimeoutExpired(cmd="npx", timeout=300)
+
+        results = setup_wizard.run_auto_setup({})
+
+        assert results["digg_installed"] is False
+        assert results["digg_action"] == "install_failed"
+
+
 class TestWriteSetupConfig:
     """Tests for write_setup_config()."""
 
     def test_creates_new_env_file(self):
-        """Creates .env file with SETUP_COMPLETE and FROM_BROWSER."""
+        """Creates .env with SETUP_COMPLETE; omits FROM_BROWSER when unspecified.
+
+        With no detected browser we must NOT pin FROM_BROWSER=auto, because
+        that makes every later run probe Chrome and re-trigger the macOS
+        Keychain prompt. Leaving it unset applies the safe Firefox/Safari
+        default instead.
+        """
         with tempfile.TemporaryDirectory() as tmpdir:
             env_path = Path(tmpdir) / "subdir" / ".env"
 
@@ -187,7 +554,7 @@ class TestWriteSetupConfig:
             assert env_path.exists()
             content = env_path.read_text()
             assert "SETUP_COMPLETE=true" in content
-            assert "FROM_BROWSER=auto" in content
+            assert "FROM_BROWSER" not in content
 
     def test_appends_to_existing_file(self):
         """Appends to existing .env without overwriting keys."""
@@ -202,9 +569,9 @@ class TestWriteSetupConfig:
             # Original keys preserved
             assert "XAI_API_KEY=my-key" in content
             assert "AUTH_TOKEN=tok123" in content
-            # New keys appended
+            # SETUP_COMPLETE appended; FROM_BROWSER omitted (no browser detected)
             assert "SETUP_COMPLETE=true" in content
-            assert "FROM_BROWSER=auto" in content
+            assert "FROM_BROWSER" not in content
 
     def test_does_not_overwrite_existing_keys(self):
         """If SETUP_COMPLETE or FROM_BROWSER already exist, don't duplicate."""
@@ -249,7 +616,7 @@ class TestWriteSetupConfig:
             env_path = Path(tmpdir) / ".env"
             env_path.write_text("EXISTING_KEY=value")  # no trailing newline
 
-            result = setup_wizard.write_setup_config(env_path)
+            result = setup_wizard.write_setup_config(env_path, from_browser="firefox")
 
             assert result is True
             content = env_path.read_text()
@@ -260,6 +627,155 @@ class TestWriteSetupConfig:
             assert "SETUP_COMPLETE=true" in lines[1]
 
 
+class TestWriteApiKey:
+    """Tests for write_api_key() — persisting the ScrapeCreators signup key."""
+
+    def test_writes_key_with_secret_permissions(self):
+        """Key is written and the file is 0o600 (owner read/write only)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env_path = Path(tmpdir) / "subdir" / ".env"
+
+            result = setup_wizard.write_api_key(env_path, "sc_live_abcdef123456")
+
+            assert result is True
+            assert env_path.exists()
+            assert "SCRAPECREATORS_API_KEY=sc_live_abcdef123456" in env_path.read_text()
+            assert (env_path.stat().st_mode & 0o777) == 0o600
+
+    def test_value_round_trips_through_env_loader(self):
+        """Persisted key reloads to the exact original value."""
+        from lib import env as env_mod
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env_path = Path(tmpdir) / ".env"
+
+            setup_wizard.write_api_key(env_path, "sc_live_abcdef123456")
+
+            loaded = env_mod.load_env_file(env_path)
+            assert loaded["SCRAPECREATORS_API_KEY"] == "sc_live_abcdef123456"
+
+    def test_idempotent_when_key_already_present(self):
+        """If the key already exists, do not duplicate or overwrite it."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env_path = Path(tmpdir) / ".env"
+            env_path.write_text("SCRAPECREATORS_API_KEY=existing_key\n")
+
+            result = setup_wizard.write_api_key(env_path, "sc_new_value")
+
+            assert result is True
+            content = env_path.read_text()
+            assert content.count("SCRAPECREATORS_API_KEY") == 1
+            assert "existing_key" in content
+            assert "sc_new_value" not in content
+
+    def test_appends_without_clobbering_other_keys(self):
+        """Existing unrelated keys are preserved."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env_path = Path(tmpdir) / ".env"
+            env_path.write_text("SETUP_COMPLETE=true\nFROM_BROWSER=firefox\n")
+
+            setup_wizard.write_api_key(env_path, "sc_key_xyz")
+
+            content = env_path.read_text()
+            assert "SETUP_COMPLETE=true" in content
+            assert "FROM_BROWSER=firefox" in content
+            assert "SCRAPECREATORS_API_KEY=sc_key_xyz" in content
+
+    def test_value_with_whitespace_is_quoted(self):
+        """A pathological value with whitespace is quoted so it round-trips."""
+        from lib import env as env_mod
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env_path = Path(tmpdir) / ".env"
+
+            setup_wizard.write_api_key(env_path, "key with space")
+
+            content = env_path.read_text()
+            assert 'SCRAPECREATORS_API_KEY="key with space"' in content
+            assert env_mod.load_env_file(env_path)["SCRAPECREATORS_API_KEY"] == "key with space"
+
+    def test_empty_key_returns_false_and_writes_nothing(self):
+        """An empty api_key persists nothing and reports failure."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env_path = Path(tmpdir) / ".env"
+
+            assert setup_wizard.write_api_key(env_path, "") is False
+            assert not env_path.exists()
+
+    def test_unwritable_target_returns_false(self):
+        """Unwritable target dir -> False, no exception escapes."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ro_dir = Path(tmpdir) / "ro"
+            ro_dir.mkdir()
+            ro_dir.chmod(0o500)  # no write
+            try:
+                result = setup_wizard.write_api_key(ro_dir / "sub" / ".env", "sc_key")
+                assert result is False
+            finally:
+                ro_dir.chmod(0o700)  # restore so tempdir cleanup succeeds
+
+
+class TestMaskApiKey:
+    """Tests for mask_api_key() — non-secret display form."""
+
+    def test_masks_long_key(self):
+        masked = setup_wizard.mask_api_key("sc_live_abcdef123456")
+        assert "abcdef" not in masked
+        assert masked.endswith("3456")
+        assert masked.startswith("sc_")
+
+    def test_short_key_collapses_to_placeholder(self):
+        assert setup_wizard.mask_api_key("short") == "sc_…"
+
+    def test_empty_key_collapses_to_placeholder(self):
+        assert setup_wizard.mask_api_key("") == "sc_…"
+
+
+class TestCookieExtractionBrowsers:
+    """Tests for env.cookie_extraction_browsers() — the shared browser policy."""
+
+    def test_default_disables_extraction(self):
+        """FROM_BROWSER unset -> no browser-cookie reads."""
+        from lib import env
+        browsers = env.cookie_extraction_browsers({})
+        assert browsers == []
+
+    def test_off_disables_extraction(self):
+        from lib import env
+        assert env.cookie_extraction_browsers({"FROM_BROWSER": "off"}) == []
+
+    def test_auto_opts_into_chrome(self):
+        from lib import env
+        assert "chrome" in env.cookie_extraction_browsers({"FROM_BROWSER": "auto"})
+
+    def test_specific_browser(self):
+        from lib import env
+        assert env.cookie_extraction_browsers({"FROM_BROWSER": "chrome"}) == ["chrome"]
+
+
+class TestWizardDoesNotProbeChromeByDefault:
+    """Regression: first-run setup must not silently read Chrome cookies."""
+
+    @patch("lib.cookie_extract.extract_cookies_with_source", return_value=None)
+    @patch("shutil.which", return_value=None)
+    def test_default_run_never_requests_chrome(self, _mock_which, mock_extract):
+        setup_wizard.run_auto_setup({})
+        requested_browsers = {call.args[0] for call in mock_extract.call_args_list}
+        assert requested_browsers == set()
+
+    @patch("lib.cookie_extract.extract_cookies_with_source", return_value=None)
+    @patch("shutil.which", return_value=None)
+    def test_from_browser_auto_does_request_chrome(self, _mock_which, mock_extract):
+        setup_wizard.run_auto_setup({"FROM_BROWSER": "auto"}, allow_browser_cookies=True)
+        requested_browsers = {call.args[0] for call in mock_extract.call_args_list}
+        assert "chrome" in requested_browsers
+
+    @patch("lib.cookie_extract.extract_cookies_with_source")
+    @patch("shutil.which", return_value=None)
+    def test_from_browser_off_skips_extraction(self, _mock_which, mock_extract):
+        results = setup_wizard.run_auto_setup({"FROM_BROWSER": "off"})
+        mock_extract.assert_not_called()
+        assert results["cookies_found"] == {}
+
+
 class TestGetSetupStatusText:
     """Tests for get_setup_status_text()."""
 
@@ -267,6 +783,7 @@ class TestGetSetupStatusText:
         """Status text mentions found cookies and yt-dlp."""
         results = {
             "cookies_found": {"x": "chrome"},
+            "browser_cookie_scan_attempted": True,
             "ytdlp_installed": True,
             "ytdlp_action": "already_installed",
             "env_written": True,
@@ -276,17 +793,101 @@ class TestGetSetupStatusText:
         assert "yt-dlp already installed" in text
         assert "Configuration saved" in text
 
-    def test_with_no_cookies_no_ytdlp(self):
-        """Status text shows no cookies and suggests yt-dlp install."""
+    def test_skipped_cookie_scan_does_not_claim_x_is_missing(self):
+        """A consent-safe skip reports setup work without an X unlock nudge."""
         results = {
             "cookies_found": {},
+            "browser_cookie_scan_attempted": False,
             "ytdlp_installed": False,
             "ytdlp_action": "no_homebrew",
             "env_written": False,
         }
         text = setup_wizard.get_setup_status_text(results)
-        assert "No browser cookies found" in text
+        assert "browser cookies" not in text.lower()
+        assert "X/Twitter" not in text
         assert "Install Homebrew first" in text
+
+    def test_consented_scan_with_no_match_stays_non_promotional(self):
+        results = {
+            "cookies_found": {},
+            "browser_cookie_scan_attempted": True,
+            "ytdlp_installed": True,
+            "ytdlp_action": "already_installed",
+            "env_written": False,
+        }
+        text = setup_wizard.get_setup_status_text(results)
+        assert "browser cookies" not in text.lower()
+        assert "X/Twitter" not in text
+
+    def test_consented_permission_denial_reports_x_and_safe_alternatives(self):
+        with patch(
+            "lib.cookie_extract.extract_cookies_with_source",
+            side_effect=PermissionError(1, "Operation not permitted", "/private/secret/Cookies"),
+        ), patch("shutil.which", return_value=None):
+            results = setup_wizard.run_auto_setup(
+                {"FROM_BROWSER": "edge"}, allow_browser_cookies=True
+            )
+        assert results["cookies_found"] == {}
+        assert results["x_cookie_access_denied"] == ["edge"]
+        text = setup_wizard.get_setup_status_text(results)
+        assert "permission denied" in text.lower()
+        assert "edge" in text
+        assert "AUTH_TOKEN" in text and "CT0" in text
+        assert "XAI_API_KEY" in text
+        assert "/private/secret" not in text
+
+    def test_missing_cookies_do_not_record_permission_denial(self):
+        with patch(
+            "lib.cookie_extract.extract_cookies_with_source", return_value=None
+        ), patch("shutil.which", return_value=None):
+            results = setup_wizard.run_auto_setup(
+                {"FROM_BROWSER": "edge"}, allow_browser_cookies=True
+            )
+        assert results["x_cookie_access_denied"] == []
+
+    def test_complete_pair_from_another_browser_supersedes_denial(self):
+        def extract(browser, domain, _cookie_names):
+            if browser == "edge":
+                raise PermissionError(1, "Operation not permitted", "/private/Cookies")
+            if browser == "firefox" and domain == ".x.com":
+                return ({"auth_token": "dummy-auth", "ct0": "dummy-ct0"}, "firefox")
+            return None
+
+        with patch(
+            "lib.cookie_extract.extract_cookies_with_source", side_effect=extract
+        ), patch("shutil.which", return_value=None):
+            results = setup_wizard.run_auto_setup(
+                {"FROM_BROWSER": "edge,firefox"}, allow_browser_cookies=True
+            )
+        assert results["cookies_found"]["x"] == "firefox"
+        assert results["x_cookie_access_denied"] == []
+
+    def test_other_source_success_does_not_clear_x_denial(self):
+        def extract(browser, domain, _cookie_names):
+            if domain == ".x.com" and browser == "edge":
+                raise PermissionError(1, "Operation not permitted", "/private/Cookies")
+            if domain == ".truthsocial.com" and browser == "chrome":
+                return ({"_session_id": "dummy-session"}, "chrome")
+            return None
+
+        with patch(
+            "lib.cookie_extract.extract_cookies_with_source", side_effect=extract
+        ), patch("shutil.which", return_value=None):
+            results = setup_wizard.run_auto_setup({}, allow_browser_cookies=True)
+        assert results["cookies_found"] == {"truthsocial": "chrome"}
+        assert results["x_cookie_access_denied"] == ["edge"]
+
+    def test_last_setup_denial_marker_is_replaced_after_success(self, tmp_path):
+        env_path = tmp_path / ".env"
+        assert setup_wizard.write_setup_config(
+            env_path, browser_consent=True, x_cookie_access_denied="edge"
+        )
+        assert setup_wizard.write_setup_config(
+            env_path, browser_consent=True, x_cookie_access_denied="none"
+        )
+        content = env_path.read_text()
+        assert "LAST30DAYS_X_COOKIE_ACCESS_DENIED=none" in content
+        assert "LAST30DAYS_X_COOKIE_ACCESS_DENIED=edge" not in content
 
     def test_status_text_installed(self):
         """Status text for freshly installed yt-dlp."""
@@ -311,26 +912,339 @@ class TestGetSetupStatusText:
         assert "yt-dlp install failed" in text
         assert "manually" in text
 
+    def test_status_text_digg_installed(self):
+        results = {"cookies_found": {}, "ytdlp_action": "already_installed",
+                   "digg_action": "installed", "env_written": False}
+        text = setup_wizard.get_setup_status_text(results)
+        assert "Installed Digg CLI" in text
+
+    def test_status_text_digg_already_installed(self):
+        results = {"cookies_found": {}, "ytdlp_action": "already_installed",
+                   "digg_action": "already_installed", "env_written": False}
+        text = setup_wizard.get_setup_status_text(results)
+        assert "Digg CLI already installed" in text
+
+    def test_status_text_digg_install_failed(self):
+        results = {"cookies_found": {}, "ytdlp_action": "already_installed",
+                   "digg_action": "install_failed", "env_written": False}
+        text = setup_wizard.get_setup_status_text(results)
+        assert "Digg CLI install failed" in text
+        assert "printing-press-library" in text
+
+    def test_status_text_digg_installed_off_path(self):
+        home = Path.home()
+        digg_path = str(home / ".local" / "bin" / "digg-pp-cli")
+        results = {"cookies_found": {}, "ytdlp_action": "already_installed",
+                   "digg_action": "installed_off_path",
+                   "digg_path": digg_path,
+                   "env_written": False}
+        text = setup_wizard.get_setup_status_text(results)
+        assert "not on PATH" in text
+        assert "$HOME/.local/bin" in text
+        assert "now active" not in text.lower()
+
+    def test_status_text_digg_installed_off_path_legacy_go_bin(self):
+        """PATH hint names the actual install dir as $HOME-relative, not ~/.local/bin."""
+        home = Path.home()
+        digg_path = str(home / "go" / "bin" / "digg-pp-cli")
+        results = {"cookies_found": {}, "ytdlp_action": "already_installed",
+                   "digg_action": "installed_off_path",
+                   "digg_path": digg_path,
+                   "env_written": False}
+        text = setup_wizard.get_setup_status_text(results)
+        assert "$HOME/go/bin" in text
+        assert ".local/bin" not in text
+
+    def test_status_text_digg_installed_off_path_missing_path(self):
+        results = {"cookies_found": {}, "ytdlp_action": "already_installed",
+                   "digg_action": "installed_off_path",
+                   "env_written": False}
+        text = setup_wizard.get_setup_status_text(results)
+        assert "not on PATH" in text
+        assert "add its install directory to PATH" in text
+
+    def test_status_text_digg_installed_off_path_empty_path(self):
+        results = {"cookies_found": {}, "ytdlp_action": "already_installed",
+                   "digg_action": "installed_off_path",
+                   "digg_path": "",
+                   "env_written": False}
+        text = setup_wizard.get_setup_status_text(results)
+        assert "add its install directory to PATH" in text
+
+    def test_digg_bin_dir_hint_windows_returns_absolute_parent(self):
+        home = Path.home()
+        digg_path = str(home / ".local" / "bin" / "digg-pp-cli")
+        expected = str(home / ".local" / "bin")
+        with patch.object(setup_wizard.os, "name", "nt"):
+            assert setup_wizard._digg_bin_dir_hint(digg_path) == expected
+
+    def test_status_text_digg_no_npx(self):
+        results = {"cookies_found": {}, "ytdlp_action": "already_installed",
+                   "digg_action": "no_npx", "env_written": False}
+        text = setup_wizard.get_setup_status_text(results)
+        assert "Digg CLI not installed" in text
+
+    def test_status_text_digg_absent_key_renders(self):
+        """No digg_action key (defensive) -> no Digg line, no error."""
+        results = {"cookies_found": {}, "ytdlp_action": "already_installed",
+                   "env_written": False}
+        text = setup_wizard.get_setup_status_text(results)
+        assert "Digg" not in text
+
 
 class TestSetupSubcommand:
-    """Tests for setup subcommand detection in argument parsing."""
+    """Tests for setup dispatch through the production entrypoint."""
 
-    def test_setup_detected_as_topic(self):
-        """The word 'setup' is treated as the setup subcommand."""
-        # Simulate what argparse produces
-        import argparse
-        parser = argparse.ArgumentParser()
-        parser.add_argument("topic", nargs="*")
-        args = parser.parse_args(["setup"])
-        topic = " ".join(args.topic) if args.topic else None
-        assert topic is not None
-        assert topic.strip().lower() == "setup"
+    def test_permission_denial_reaches_cli_and_saved_doctor_marker(self, tmp_path, capsys):
+        env_path = tmp_path / ".env"
+        results = {
+            "cookies_found": {},
+            "x_cookie_access_denied": ["edge"],
+            "browser_cookie_scan_attempted": True,
+            "ytdlp_action": "already_installed",
+        }
+        with patch.object(sys, "argv", ["last30days", "setup", "--allow-browser-cookies"]), patch.object(
+            cli.env, "get_config", return_value={"FROM_BROWSER": "edge"}
+        ), patch.object(cli.env, "CONFIG_FILE", env_path), patch.object(
+            setup_wizard, "run_auto_setup", return_value=results
+        ):
+            assert cli.main() == 0
+        notice = capsys.readouterr().err
+        assert "permission denied" in notice.lower()
+        assert "edge" in notice
+        assert "LAST30DAYS_X_COOKIE_ACCESS_DENIED=edge" in env_path.read_text()
+
+    def test_no_scan_preserves_last_consented_denial(self, tmp_path):
+        env_path = tmp_path / ".env"
+        env_path.write_text("LAST30DAYS_X_COOKIE_ACCESS_DENIED=edge\n")
+        results = {
+            "cookies_found": {},
+            "x_cookie_access_denied": [],
+            "browser_cookie_scan_attempted": False,
+            "ytdlp_action": "already_installed",
+        }
+        with patch.object(sys, "argv", ["last30days", "setup"]), patch.object(
+            cli.env, "get_config",
+            return_value={"LAST30DAYS_X_COOKIE_ACCESS_DENIED": "edge"},
+        ), patch.object(cli.env, "CONFIG_FILE", env_path), patch.object(
+            setup_wizard, "run_auto_setup", return_value=results
+        ):
+            assert cli.main() == 0
+        assert "LAST30DAYS_X_COOKIE_ACCESS_DENIED=edge" in env_path.read_text()
+
+    def test_explicit_browser_off_with_consent_does_not_clear_last_denial(self, tmp_path):
+        env_path = tmp_path / ".env"
+        env_path.write_text("LAST30DAYS_X_COOKIE_ACCESS_DENIED=edge\nFROM_BROWSER=off\n")
+        with patch.object(sys, "argv", ["last30days", "setup", "--allow-browser-cookies"]), patch.object(
+            cli.env, "get_config",
+            return_value={"FROM_BROWSER": "off", "LAST30DAYS_X_COOKIE_ACCESS_DENIED": "edge"},
+        ), patch.object(cli.env, "CONFIG_FILE", env_path), patch(
+            "lib.cookie_extract.extract_cookies_with_source",
+            side_effect=AssertionError("browser read despite FROM_BROWSER=off"),
+        ), patch.object(setup_wizard, "_install_digg_cli", return_value=(False, "no_npx", "", None)), patch.object(
+            setup_wizard, "install_default_pp_sources", return_value={}
+        ), patch("shutil.which", return_value=None):
+            assert cli.main() == 0
+        content = env_path.read_text()
+        assert "LAST30DAYS_X_COOKIE_ACCESS_DENIED=edge" in content
+        assert "BROWSER_CONSENT=true" in content
+
+    def test_setup_detected_as_topic(self, capsys):
+        with patch.object(sys, "argv", ["last30days", "setup"]), patch.object(
+            cli.env, "get_config", return_value={}
+        ), patch.object(setup_wizard, "run_auto_setup", return_value={}) as setup, patch.object(
+            setup_wizard, "write_setup_config", return_value=True
+        ) as write_config, patch.object(
+            setup_wizard, "get_setup_status_text", return_value="setup-completed-sentinel"
+        ), patch.object(cli.pipeline, "run") as research:
+            assert cli.main() == 0
+        setup.assert_called_once_with({}, allow_browser_cookies=False)
+        write_config.assert_called_once()
+        research.assert_not_called()
+        assert "setup-completed-sentinel" in capsys.readouterr().err
 
     def test_normal_topic_not_setup(self):
-        """A normal topic is not confused with setup."""
-        import argparse
-        parser = argparse.ArgumentParser()
-        parser.add_argument("topic", nargs="*")
-        args = parser.parse_args(["AI", "video", "tools"])
-        topic = " ".join(args.topic) if args.topic else None
-        assert topic.strip().lower() != "setup"
+        with patch.object(sys, "argv", ["last30days", "AI", "setup", "tools", "--mock"]), patch.object(
+            cli.env, "get_config", return_value={}
+        ), patch.object(setup_wizard, "run_auto_setup", return_value={}) as setup, patch.object(
+            setup_wizard, "write_setup_config", return_value=True
+        ), patch.object(setup_wizard, "get_setup_status_text", return_value="setup-sentinel"), patch.object(
+            cli.pipeline, "diagnose", side_effect=RuntimeError("research-path-sentinel")
+        ) as research:
+            with pytest.raises(RuntimeError, match="research-path-sentinel"):
+                cli.main()
+        research.assert_called_once()
+        setup.assert_not_called()
+
+
+class TestBrightDataStatusHonesty:
+    """U5/R11: setup must never claim active unless the engine gate passes."""
+
+    def _patched(self, *, installed, credentialed, off_path=None):
+        available = installed and credentialed
+        return (
+            patch.object(setup_wizard.brightdata, "is_installed", return_value=installed),
+            patch.object(setup_wizard.brightdata, "has_credentials", return_value=credentialed),
+            patch.object(setup_wizard.brightdata, "is_available", return_value=available),
+            patch.object(setup_wizard, "_brightdata_off_path_binary", return_value=off_path),
+        )
+
+    def test_on_path_and_credentialed_reports_engine_active(self):
+        a, b, c, d = self._patched(installed=True, credentialed=True)
+        with a, b, c, d:
+            status = setup_wizard.brightdata_status({})
+        assert status["action"] == "already_installed"
+        assert status["authenticated"] is True
+        assert status["engine_active"] is True
+
+    def test_on_path_without_credentials_is_not_active_and_names_login(self):
+        a, b, c, d = self._patched(installed=True, credentialed=False)
+        with a, b, c, d:
+            status = setup_wizard.brightdata_status({})
+        assert status["action"] == "already_installed"
+        assert status["authenticated"] is False
+        assert status["engine_active"] is False
+        assert "brightdata login" in status["hint"]
+
+    def test_off_path_binary_is_reported_with_its_path(self):
+        """The Hermes/OpenClaw failure mode: on disk, invisible to the engine."""
+        a, b, c, d = self._patched(
+            installed=False, credentialed=True, off_path="/Users/x/.npm-global/bin/brightdata"
+        )
+        with a, b, c, d:
+            status = setup_wizard.brightdata_status({})
+        assert status["action"] == "installed_off_path"
+        assert status["engine_active"] is False
+        assert status["path"] == "/Users/x/.npm-global/bin/brightdata"
+        assert "PATH" in status["hint"]
+
+    def test_absent_binary_recommends_but_never_installs(self):
+        a, b, c, d = self._patched(installed=False, credentialed=False)
+        with a, b, c, d, patch.object(setup_wizard.subprocess, "run") as run:
+            status = setup_wizard.brightdata_status({})
+        assert status["action"] == "not_installed"
+        assert status["engine_active"] is False
+        run.assert_not_called()
+
+    def test_brightdata_is_excluded_from_auto_installed_pp_sources(self):
+        slugs = {slug for _, slug, _ in setup_wizard.PP_DEFAULT_SOURCES}
+        assert "brightdata" not in slugs
+
+
+class TestBrightDataSetupSurface:
+    """The three states must be visible somewhere, or the honesty is moot."""
+
+    def _text(self, status):
+        return setup_wizard.get_setup_status_text({
+            "cookies_found": {}, "ytdlp_installed": True,
+            "ytdlp_action": "already_installed", "digg_installed": True,
+            "digg_action": "already_installed", "pp_sources": {},
+            "brightdata": status, "env_written": False,
+        })
+
+    def test_active_state_is_reported(self):
+        text = self._text({"action": "already_installed", "engine_active": True})
+        assert "Bright Data CLI ready" in text
+
+    def test_installed_but_not_logged_in_names_the_fix(self):
+        text = self._text({"action": "already_installed", "engine_active": False})
+        assert "brightdata login" in text
+
+    def test_off_path_reports_the_path_and_the_fix(self):
+        text = self._text({
+            "action": "installed_off_path", "engine_active": False,
+            "path": "/Users/x/.npm-global/bin/brightdata",
+        })
+        assert "/Users/x/.npm-global/bin/brightdata" in text
+        assert "PATH" in text
+
+    def test_absent_offers_the_install_command_without_running_it(self):
+        text = self._text({"action": "not_installed", "engine_active": False})
+        assert "npm i -g @brightdata/cli" in text
+
+
+def _device_code_response(interval):
+    """Build a mocked urlopen context manager yielding a device/code payload."""
+    resp_data = {
+        "device_code": "dc-123",
+        "user_code": "ABCD-1234",
+        "verification_uri": "https://github.com/login/device",
+        "interval": interval,
+    }
+    mock_resp = MagicMock()
+    mock_resp.read.return_value = json.dumps(resp_data).encode()
+    mock_resp.__enter__ = lambda s: s
+    mock_resp.__exit__ = MagicMock(return_value=False)
+    return mock_resp
+
+
+class TestDeviceIntervalClamp:
+    """Server-controlled poll intervals are clamped to [1, 30] before use."""
+
+    @pytest.mark.parametrize("server,expected", [
+        (0, 5),
+        (-5, 1),
+        (3600, 30),
+        ("abc", 5),
+        (None, 5),
+        ("7", 7),
+    ])
+    @patch("lib.setup_wizard.urlopen")
+    def test_run_device_auth_clamps_server_interval(
+        self, mock_urlopen, server, expected
+    ):
+        """run_device_auth never returns 0/negative/huge/non-numeric intervals."""
+        mock_urlopen.return_value = _device_code_response(server)
+
+        result = setup_wizard.run_device_auth()
+
+        assert result is not None
+        assert result[3] == expected
+
+    @pytest.mark.parametrize("stored,expected", [
+        (0, 5),
+        (-10, 1),
+        (9999, 30),
+        ("junk", 5),
+    ])
+    @patch("lib.setup_wizard._device_handle_path")
+    @patch("lib.setup_wizard.fetch_api_key")
+    @patch("lib.setup_wizard.poll_device_auth")
+    def test_run_github_poll_clamps_stored_interval(
+        self, mock_poll, mock_fetch, mock_handle, tmp_path, stored, expected
+    ):
+        """A poisoned persisted handle (or server value) cannot hot-loop,
+        crash, or sail past the timeout via time.sleep(interval)."""
+        handle = tmp_path / "h.json"
+        handle.write_text(json.dumps(
+            {"device_code": "dc", "interval": stored, "user_code": "ABCD-1234"}
+        ))
+        mock_handle.return_value = handle
+        mock_poll.return_value = "tok"
+        mock_fetch.return_value = {"ok": True, "api_key": "sc_k"}
+
+        result = setup_wizard.run_github_poll(timeout=1)
+
+        assert result["status"] == "success"
+        assert mock_poll.call_args[0][1] == expected
+
+    @pytest.mark.parametrize("raw,expected", [
+        (0, 5),
+        (-5, 1),
+        (3600, 30),
+    ])
+    @patch("lib.setup_wizard.urlopen")
+    @patch("lib.setup_wizard.time.sleep")
+    def test_poll_device_auth_clamps_own_interval(
+        self, mock_sleep, mock_urlopen, raw, expected
+    ):
+        """poll_device_auth validates its own interval even when a caller
+        passes 0/negative/huge straight through."""
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps({"access_token": "tok"}).encode()
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_resp
+
+        assert setup_wizard.poll_device_auth("dc", raw, timeout=30) == "tok"
+        mock_sleep.assert_called_once_with(expected)

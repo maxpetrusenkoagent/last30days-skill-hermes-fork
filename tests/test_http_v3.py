@@ -1,5 +1,9 @@
+import io
+import threading
 import urllib.error
 import unittest
+import time
+from urllib.parse import parse_qs, unquote, urlsplit
 from unittest.mock import patch, MagicMock
 
 from lib import http
@@ -37,6 +41,132 @@ class Test429RetryLimit(unittest.TestCase):
             http.request("GET", "http://example.com", retries=3)
 
         self.assertEqual(mock_urlopen.call_count, 3)
+
+    @patch("lib.http.urllib.request.urlopen")
+    @patch("lib.http.time.sleep")
+    @patch("lib.http.time.monotonic", return_value=0.5)
+    def test_shared_deadline_stops_retry_before_backoff_crosses_it(
+        self,
+        _mock_monotonic,
+        mock_sleep,
+        mock_urlopen,
+    ):
+        mock_urlopen.side_effect = urllib.error.HTTPError(
+            "http://example.com", 500, "Internal Server Error", {}, None
+        )
+
+        with self.assertRaises(http.HTTPError) as caught:
+            http.request(
+                "GET",
+                "http://example.com",
+                retries=3,
+                deadline_monotonic=1.0,
+            )
+
+        self.assertEqual(http.health.TIMEOUT, caught.exception.outcome_state)
+        self.assertEqual(1, mock_urlopen.call_count)
+        mock_sleep.assert_not_called()
+
+    @patch("lib.http.urllib.request.urlopen")
+    @patch("lib.http.time.monotonic", side_effect=[0.0, 0.5, 1.5])
+    def test_shared_deadline_rejects_response_that_finishes_late(
+        self,
+        _mock_monotonic,
+        mock_urlopen,
+    ):
+        mock_urlopen.return_value = _mock_response()
+
+        with self.assertRaises(http.DeadlineExceeded):
+            http.request(
+                "GET",
+                "http://example.com",
+                retries=1,
+                deadline_monotonic=1.0,
+            )
+
+    @patch("lib.http.urllib.request.urlopen")
+    def test_shared_deadline_stops_waiting_during_slow_body_read(
+        self,
+        mock_urlopen,
+    ):
+        response = _mock_response()
+
+        def slow_read():
+            time.sleep(0.2)
+            return b'{"ok": true}'
+
+        response.read.side_effect = slow_read
+        mock_urlopen.return_value = response
+        started = time.monotonic()
+
+        with self.assertRaises(http.DeadlineExceeded):
+            http.request(
+                "GET",
+                "http://example.com",
+                retries=1,
+                deadline_monotonic=started + 0.02,
+            )
+
+        self.assertLess(time.monotonic() - started, 0.12)
+
+    @patch("lib.http.urllib.request.urlopen")
+    def test_shared_deadline_stops_waiting_during_error_body_read(self, mock_urlopen):
+        release = threading.Event()
+        read_started = threading.Event()
+
+        class SlowBody(io.BytesIO):
+            def read(self, *args, **kwargs):
+                read_started.set()
+                release.wait(1)
+                return super().read(*args, **kwargs)
+
+        mock_urlopen.side_effect = urllib.error.HTTPError(
+            "https://example.com", 500, "Server error", {}, SlowBody(b"error")
+        )
+        started = time.monotonic()
+        try:
+            with self.assertRaises(http.DeadlineExceeded):
+                http.request(
+                    "GET", "https://example.com", retries=1,
+                    deadline_monotonic=started + 0.05,
+                )
+            self.assertTrue(read_started.is_set())
+            self.assertLess(time.monotonic() - started, 0.5)
+            self.assertEqual(mock_urlopen.call_count, 1)
+        finally:
+            release.set()
+
+    @patch("lib.http.urllib.request.urlopen")
+    def test_error_body_within_deadline_keeps_status_and_body(self, mock_urlopen):
+        mock_urlopen.side_effect = urllib.error.HTTPError(
+            "https://example.com", 401, "Unauthorized", {}, io.BytesIO(b"bad token")
+        )
+        with self.assertRaises(http.HTTPError) as caught:
+            http.request(
+                "GET", "https://example.com", retries=1,
+                deadline_monotonic=time.monotonic() + 1,
+            )
+        self.assertEqual(caught.exception.status_code, 401)
+        self.assertEqual(caught.exception.body, "bad token")
+        self.assertEqual(caught.exception.outcome_state, http.health.AUTH_FAILED)
+
+    @patch("lib.http.urllib.request.urlopen")
+    def test_worker_socket_timeout_is_not_wall_deadline_expiration(
+        self,
+        mock_urlopen,
+    ):
+        mock_urlopen.side_effect = TimeoutError("early socket timeout")
+
+        with self.assertRaises(http.HTTPError) as caught:
+            http.request(
+                "GET",
+                "http://example.com",
+                retries=1,
+                deadline_monotonic=time.monotonic() + 600,
+            )
+
+        self.assertNotIsInstance(caught.exception, http.DeadlineExceeded)
+        self.assertEqual(http.health.TIMEOUT, caught.exception.outcome_state)
 
 
 def _mock_response(body: str = '{"ok": true}', status: int = 200):
@@ -101,6 +231,41 @@ class TestParamsEncoding(unittest.TestCase):
         self.assertIn("count=25", sent_url)
         self.assertIn("raw=True", sent_url)
 
+    @patch("lib.http.urllib.request.urlopen")
+    def test_arabic_query_param_is_percent_encoded(self, mock_urlopen):
+        mock_urlopen.return_value = _mock_response()
+        arabic_topic = "اسعار التمريض المنزلي"
+        http.get("https://api.scrapecreators.com/v1/tiktok/search/keyword",
+                 params={"query": arabic_topic})
+        sent_url = self._sent_url(mock_urlopen)
+        sent_url.encode("ascii")
+        self.assertIn("%D8%A7", sent_url)
+        self.assertEqual(parse_qs(urlsplit(sent_url).query)["query"], [arabic_topic])
+
+    @patch("lib.http.urllib.request.urlopen")
+    def test_cjk_query_param_is_percent_encoded(self, mock_urlopen):
+        mock_urlopen.return_value = _mock_response()
+        http.get("https://api.example.com/search", params={"q": "人工智能"})
+        sent_url = self._sent_url(mock_urlopen)
+        sent_url.encode("ascii")
+        self.assertEqual(parse_qs(urlsplit(sent_url).query)["q"], ["人工智能"])
+
+    @patch("lib.http.urllib.request.urlopen")
+    def test_non_ascii_in_base_url_path_is_percent_encoded(self, mock_urlopen):
+        mock_urlopen.return_value = _mock_response()
+        http.get("https://api.example.com/search/العربية")
+        sent_url = self._sent_url(mock_urlopen)
+        sent_url.encode("ascii")
+        self.assertEqual(unquote(urlsplit(sent_url).path), "/search/العربية")
+
+    @patch("lib.http.urllib.request.urlopen")
+    def test_non_ascii_in_raw_url_query_string_is_percent_encoded(self, mock_urlopen):
+        mock_urlopen.return_value = _mock_response()
+        http.get("https://api.example.com/search?q=العربية")
+        sent_url = self._sent_url(mock_urlopen)
+        sent_url.encode("ascii")
+        self.assertEqual(parse_qs(urlsplit(sent_url).query)["q"], ["العربية"])
+
 
 class TestDNSResolutionRetry(unittest.TestCase):
     """DNS resolution failures (gaierror) must retry with exponential backoff.
@@ -124,6 +289,18 @@ class TestDNSResolutionRetry(unittest.TestCase):
             http.request("GET", "http://nonexistent.example", retries=2)
 
         # Caller passed retries=2, but the budget expanded to MIN_DNS_RETRIES=3.
+        self.assertEqual(mock_urlopen.call_count, http.MIN_DNS_RETRIES)
+
+    @patch("lib.http.urllib.request.urlopen")
+    @patch("lib.http.time.sleep")
+    def test_dns_failure_widens_single_attempt_budget(self, mock_sleep, mock_urlopen):
+        """DNS failures widen the budget to MIN_DNS_RETRIES, even from retries=1."""
+        import socket
+        mock_urlopen.side_effect = urllib.error.URLError(socket.gaierror(-2, "DNS failure"))
+
+        with self.assertRaises(http.HTTPError):
+            http.request("GET", "https://example.com", retries=1)
+
         self.assertEqual(mock_urlopen.call_count, http.MIN_DNS_RETRIES)
 
     @patch("lib.http.urllib.request.urlopen")
@@ -154,12 +331,11 @@ class TestDNSResolutionRetry(unittest.TestCase):
         mock_urlopen.side_effect = err
 
         with self.assertRaises(http.HTTPError):
-            http.request("GET", "http://nonexistent.example", retries=3)
+            http.request("GET", "http://nonexistent.example", retries=4)
 
-        # Expected sleep calls: 1s (after attempt 1), 2s (after attempt 2).
-        # No sleep after the final attempt (the loop exits to raise).
         sleep_delays = [call.args[0] for call in mock_sleep.call_args_list]
-        self.assertEqual(sleep_delays, [1, 2])
+        self.assertEqual(sleep_delays, [1, 2, 4])
+        self.assertEqual(mock_urlopen.call_count, 4)
 
     @patch("lib.http.urllib.request.urlopen")
     @patch("lib.http.time.sleep")
@@ -214,3 +390,48 @@ class TestDNSResolutionRetry(unittest.TestCase):
             http.request("GET", "http://flaky.example", retries=2)
 
         self.assertEqual(mock_urlopen.call_count, 2)
+
+
+class TestDebugLogRedaction(unittest.TestCase):
+    """Debug log lines must not echo credentials the request carried."""
+
+    SECRET = "sk-live-abcdef1234567890"
+
+    def _logged(self, mock_log) -> str:
+        return "\n".join(call.args[0] for call in mock_log.call_args_list)
+
+    @patch("lib.http.log")
+    @patch("lib.http.urllib.request.urlopen")
+    def test_error_body_echoing_bearer_token_is_redacted(self, mock_urlopen, mock_log):
+        mock_urlopen.side_effect = urllib.error.HTTPError(
+            "https://example.com", 401, "Unauthorized", {},
+            io.BytesIO(f"invalid key Bearer {self.SECRET}".encode("utf-8")),
+        )
+
+        with self.assertRaises(http.HTTPError):
+            http.request(
+                "POST", "https://example.com", retries=1,
+                headers={"Authorization": f"Bearer {self.SECRET}"},
+                json_data={"q": "x"},
+            )
+
+        logged = self._logged(mock_log)
+        self.assertIn("Error body:", logged)
+        self.assertIn("<redacted>", logged)
+        self.assertNotIn(self.SECRET, logged)
+
+    @patch("lib.http.log")
+    @patch("lib.http.urllib.request.urlopen")
+    @patch("lib.http.time.sleep")
+    def test_url_error_echoing_api_key_is_redacted(self, _mock_sleep, mock_urlopen, mock_log):
+        mock_urlopen.side_effect = urllib.error.URLError(f"proxy refused key {self.SECRET}")
+
+        with self.assertRaises(http.HTTPError):
+            http.request(
+                "GET", "https://example.com", retries=1,
+                headers={"X-Api-Key": self.SECRET},
+            )
+
+        logged = self._logged(mock_log)
+        self.assertIn("URL Error:", logged)
+        self.assertNotIn(self.SECRET, logged)

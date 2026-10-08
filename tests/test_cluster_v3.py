@@ -110,12 +110,20 @@ class TestCrossSourceMerging(unittest.TestCase):
             make_candidate("c1", "reddit", "Kanye West Wireless Festival headline announcement", "Three nights!", 80),
             make_candidate("c2", "reddit", "Kanye West returning to Wireless Festival confirmed", "UK comeback.", 70),
         ]
-        clusters = cluster.cluster_candidates(candidates, self._plan())
-        # The initial greedy pass may or may not merge these (depends on token similarity).
-        # But if they end up as separate clusters, the entity pass should NOT merge them
-        # since they're both from reddit.
-        for cl in clusters:
-            self.assertTrue(len(cl.sources) >= 1)  # basic sanity
+        initial = [
+            schema.Cluster(
+                cluster_id=f"cluster-{candidate.candidate_id}",
+                title=candidate.title,
+                candidate_ids=[candidate.candidate_id],
+                representative_ids=[candidate.candidate_id],
+                sources=[candidate.source],
+                score=candidate.final_score,
+            )
+            for candidate in candidates
+        ]
+        clusters = cluster._merge_entity_clusters(initial, candidates)
+        self.assertEqual([("c1",), ("c2",)], [tuple(cl.candidate_ids) for cl in clusters])
+        self.assertEqual([["reddit"], ["reddit"]], [cl.sources for cl in clusters])
 
 
 class TestPolymarketIsolation(unittest.TestCase):
@@ -168,6 +176,84 @@ class TestPolymarketIsolation(unittest.TestCase):
         clusters = cluster.cluster_candidates(candidates, self._plan())
         self.assertEqual(1, len(clusters))
         self.assertEqual(2, len(clusters[0].candidate_ids))
+
+
+class TestStaleClusterDemotion(unittest.TestCase):
+    """Stale candidates must never become cluster representatives or titles."""
+
+    def _plan(self):
+        return schema.QueryPlan(
+            intent="breaking_news",
+            freshness_mode="strict_recent",
+            cluster_mode="story",
+            raw_topic="test",
+            subqueries=[schema.SubQuery(label="primary", search_query="test", ranking_query="test", sources=["reddit", "x"])],
+            source_weights={"reddit": 0.5, "x": 0.5},
+        )
+
+    def _candidate_with_date(
+        self, candidate_id: str, source: str, title: str, score: float,
+        published_at: str, date_confidence: str, range_from: str, range_to: str,
+    ) -> schema.Candidate:
+        item = schema.SourceItem(
+            item_id=candidate_id,
+            source=source,
+            title=title,
+            body=title,
+            url=f"https://example.com/{candidate_id}",
+            published_at=published_at,
+            date_confidence=date_confidence,
+        )
+        return schema.Candidate(
+            candidate_id=candidate_id,
+            item_id=candidate_id,
+            source=source,
+            title=title,
+            url=f"https://example.com/{candidate_id}",
+            snippet=title,
+            subquery_labels=["primary"],
+            native_ranks={"primary:reddit": 1},
+            local_relevance=0.8,
+            freshness=80,
+            engagement=10,
+            source_quality=0.7,
+            rrf_score=0.02,
+            rerank_score=score,
+            final_score=score,
+            source_items=[item],
+            metadata={"range_from": range_from, "range_to": range_to},
+        )
+
+    def test_stale_candidate_not_cluster_representative(self):
+        """A stale item with higher final_score must not lead a cluster over a fresh item.
+
+        This guards against the issue where a 2025-10 video ranked #1 in a
+        2026-07 brief because clustering re-sorted by final_score alone.
+        """
+        range_from = "2026-06-15"
+        range_to = "2026-07-15"
+        stale = self._candidate_with_date(
+            "stale", "reddit", "Model launch reactions discussion",
+            score=95.0,
+            published_at="2025-10-15",
+            date_confidence="low",
+            range_from=range_from,
+            range_to=range_to,
+        )
+        fresh = self._candidate_with_date(
+            "fresh", "x", "Model launch reactions update",
+            score=50.0,
+            published_at="2026-07-10",
+            date_confidence="high",
+            range_from=range_from,
+            range_to=range_to,
+        )
+        candidates = [stale, fresh]
+        clusters = cluster.cluster_candidates(candidates, self._plan())
+
+        self.assertEqual(1, len(clusters))
+        self.assertEqual("fresh", clusters[0].representative_ids[0])
+        self.assertEqual(fresh.title, clusters[0].title)
 
 
 class TestClusterUncertainty(unittest.TestCase):

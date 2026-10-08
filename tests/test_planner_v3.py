@@ -4,6 +4,56 @@ from lib import planner
 
 
 class PlannerV3Tests(unittest.TestCase):
+    def test_external_plan_rejects_valid_json_with_wrong_structure(self):
+        with self.assertRaisesRegex(ValueError, "intent"):
+            planner.validate_external_plan({"queries": {"web": ["Berlin"]}})
+
+    def test_external_plan_accepts_documented_shape_without_source_weights(self):
+        planner.validate_external_plan(
+            {
+                "intent": "breaking_news",
+                "freshness_mode": "strict_recent",
+                "cluster_mode": "story",
+                "subqueries": [
+                    {
+                        "label": "primary",
+                        "search_query": "kanye west",
+                        "ranking_query": "What happened with Kanye West?",
+                        "sources": ["reddit", "x"],
+                        "weight": 1.0,
+                    }
+                ],
+            }
+        )
+
+    def test_external_plan_rejects_non_numeric_weight(self):
+        base_plan = {
+            "intent": "breaking_news",
+            "freshness_mode": "strict_recent",
+            "cluster_mode": "story",
+            "subqueries": [
+                {
+                    "label": "primary",
+                    "search_query": "kanye west",
+                    "ranking_query": "What happened with Kanye West?",
+                    "sources": ["reddit", "x"],
+                    "weight": 1.0,
+                }
+            ],
+        }
+        for invalid_weight in ("heavy", True):
+            with self.subTest(subquery_weight=invalid_weight):
+                invalid_plan = dict(base_plan)
+                invalid_plan["subqueries"] = [
+                    dict(base_plan["subqueries"][0], weight=invalid_weight)
+                ]
+                with self.assertRaisesRegex(ValueError, "weight"):
+                    planner.validate_external_plan(invalid_plan)
+
+        invalid_source_weight = dict(base_plan, source_weights={"x": True})
+        with self.assertRaisesRegex(ValueError, "source_weights"):
+            planner.validate_external_plan(invalid_source_weight)
+
     def test_default_how_to_expands_past_llm_narrow_source_weights(self):
         raw = {
             "intent": "how_to",
@@ -92,7 +142,97 @@ class PlannerV3Tests(unittest.TestCase):
         self.assertEqual(1, len(plan.subqueries))
         self.assertEqual(["reddit", "x"], plan.subqueries[0].sources)
 
-    def test_quick_mode_preserves_explicit_requested_sources(self):
+    def test_operator_plan_keeps_per_subquery_sources_at_default_and_deep(self):
+        # Issue #1073: operator --plan sources must not be replaced with the
+        # full available list outside --quick.
+        raw = {
+            "intent": "opinion",
+            "freshness_mode": "balanced_recent",
+            "cluster_mode": "debate",
+            "subqueries": [{
+                "label": "primary",
+                "search_query": "late diagnosed autism adults",
+                "ranking_query": "late diagnosed autism adults",
+                "sources": ["reddit", "x", "youtube"],
+                "weight": 1.0,
+            }],
+        }
+        avail = ["reddit", "x", "youtube", "hackernews", "polymarket", "github"]
+        for depth in ("default", "deep"):
+            with self.subTest(depth=depth):
+                plan = planner._sanitize_plan(
+                    raw,
+                    "late diagnosed autism adults",
+                    avail,
+                    None,
+                    depth,
+                    honor_plan_sources=True,
+                )
+                self.assertEqual(["reddit", "x", "youtube"], plan.subqueries[0].sources)
+
+    def test_llm_plan_still_expands_narrow_sources_at_default_and_deep(self):
+        # Engine-internal LLM plans keep the expansion that lets fusion
+        # decide quality. Same snippet as #1073, without honor_plan_sources.
+        raw = {
+            "intent": "opinion",
+            "freshness_mode": "balanced_recent",
+            "cluster_mode": "debate",
+            "subqueries": [{
+                "label": "primary",
+                "search_query": "late diagnosed autism adults",
+                "ranking_query": "late diagnosed autism adults",
+                "sources": ["reddit", "x", "youtube"],
+                "weight": 1.0,
+            }],
+        }
+        avail = ["reddit", "x", "youtube", "hackernews", "polymarket", "github"]
+        for depth in ("default", "deep"):
+            with self.subTest(depth=depth):
+                plan = planner._sanitize_plan(
+                    raw,
+                    "late diagnosed autism adults",
+                    avail,
+                    None,
+                    depth,
+                )
+                self.assertEqual(avail, plan.subqueries[0].sources)
+
+    def test_operator_plan_preserves_distinct_per_subquery_source_lists(self):
+        raw = {
+            "intent": "breaking_news",
+            "freshness_mode": "strict_recent",
+            "cluster_mode": "story",
+            "subqueries": [
+                {
+                    "label": "primary",
+                    "search_query": "kanye west",
+                    "ranking_query": "What happened with Kanye West?",
+                    "sources": ["reddit", "x", "youtube"],
+                    "weight": 1.0,
+                },
+                {
+                    "label": "album",
+                    "search_query": "kanye west bully album",
+                    "ranking_query": "How was Kanye West's BULLY album received?",
+                    "sources": ["youtube", "reddit"],
+                    "weight": 0.8,
+                },
+            ],
+        }
+        avail = ["reddit", "x", "youtube", "hackernews", "polymarket", "github"]
+        plan = planner._sanitize_plan(
+            raw,
+            "Kanye West",
+            avail,
+            None,
+            "default",
+            honor_plan_sources=True,
+        )
+        by_label = {sq.label: sq.sources for sq in plan.subqueries}
+        self.assertEqual(["reddit", "x", "youtube"], by_label["primary"])
+        self.assertEqual(["youtube", "reddit"], by_label["album"])
+
+    def test_quick_mode_prioritizes_explicit_requested_sources_within_cap(self):
         raw = {
             "intent": "product",
             "freshness_mode": "balanced_recent",
@@ -111,10 +251,11 @@ class PlannerV3Tests(unittest.TestCase):
             raw,
             "AI coding agents",
             ["reddit", "youtube", "grounding", "digg"],
-            ["reddit", "youtube", "grounding", "digg"],
+            ["digg", "reddit", "youtube", "grounding"],
             "quick",
         )
         self.assertIn("digg", plan.subqueries[0].sources)
+        self.assertLessEqual(len(plan.subqueries[0].sources), 2)
 
     def test_quick_mode_preserves_explicit_requested_sources_in_fallback_plan(self):
         plan = planner.plan_query(
@@ -207,6 +348,19 @@ class PlannerV3Tests(unittest.TestCase):
         # how_to routing should include youtube (longform) over tiktok/instagram
         self.assertIn("youtube", sources)
         self.assertIn("reddit", sources)
+
+    def test_product_plan_can_include_jobs_source(self):
+        plan = planner.plan_query(
+            topic="Listen Labs features",
+            available_sources=["reddit", "youtube", "jobs", "hackernews"],
+            requested_sources=None,
+            depth="default",
+            provider=None,
+            model=None,
+        )
+        self.assertEqual("product", plan.intent)
+        self.assertIn("jobs", plan.subqueries[0].sources)
+        self.assertGreater(plan.source_weights["jobs"], plan.source_weights["youtube"])
 
     def test_prediction_includes_tiktok_and_instagram(self):
         """TikTok and Instagram are no longer excluded from prediction intent."""
@@ -328,7 +482,11 @@ class IntentModifierBreadthTests(unittest.TestCase):
         self.assertEqual(5, planner._max_subqueries("product"))
 
     def test_max_subqueries_unchanged_for_comparison(self):
-        self.assertEqual(4, planner._max_subqueries("comparison"))
+        from lib import competitors
+        self.assertEqual(
+            competitors.COMPARISON_ENTITY_MAX + 1,
+            planner._max_subqueries("comparison"),
+        )
 
     def test_max_subqueries_unchanged_for_factual_and_concept(self):
         self.assertEqual(2, planner._max_subqueries("factual"))
@@ -457,11 +615,12 @@ class FallbackDefaultsTests(unittest.TestCase):
         # The old misleading phrasing must NOT appear.
         self.assertNotIn("No --plan and no LLM provider configured", output)
 
-    def test_fallback_does_not_log_new_warning_when_provider_present(self):
+    def test_provider_failure_logs_error_and_law7_reminder(self):
         # When a provider is configured, the provider path runs; if it
-        # errors, we get the "LLM planning failed" message, NOT the
-        # "No --plan passed" guidance (which is specifically for the
-        # no-provider-no-plan caller path).
+        # errors, we get the "LLM planning failed" message AND the
+        # "No --plan passed" guidance: a failed internal planner degrades
+        # the run exactly like having none, and the host may not be
+        # detectable (see test_law7_host_plan_gate.py).
         import io
         import contextlib
         buf = io.StringIO()
@@ -481,7 +640,7 @@ class FallbackDefaultsTests(unittest.TestCase):
             )
         output = buf.getvalue()
         self.assertIn("LLM planning failed", output)
-        self.assertNotIn("No --plan passed", output)
+        self.assertIn("No --plan passed", output)
 
 if __name__ == "__main__":
     unittest.main()
